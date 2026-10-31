@@ -84,4 +84,20 @@ pub const CONTOUR_TO_QUERY_CHAR: [char; MIDI_NUM as usize] = [
 //  and with searching strings for names 3 seems to be better :)
 pub const QUERY_NGRAM_SIZE_CONTOUR: usize = 4;  // "quadgram"
 pub const QUERY_NGRAM_SIZE_NAME: usize = 3;     // "trigram"
+// KEPT AT 2000 (Cadence, 2026-09-01). Lowering it is the single biggest
+// speed lever — pass 2 is ~80% of a query and is linear in this number — and
+// 500 was measured safe on the criterion that looked right: all 57 windows
+// with a confident top-1 kept their winner. It is NOT safe. Full backtest on
+// the 4 annotated sessions: recall 97/118 at 2000, 94/118 at 1000, 93/118 at
+// 500 — real detections lost, reproducibly (the old engine re-run scores the
+// same 97, so this is not its tie-order noise).
+//
+// The mechanism is not shortlist membership, which is what one naturally
+// checks: run_contour_query deduplicates by tune_id and keeps each tune's
+// BEST-scoring setting. A popular tune has many settings; cutting the
+// shortlist cuts how many of them get aligned, so the maximum over them —
+// the score the tune is finally reported with — drops. A tune sitting just
+// above the detector threshold falls under it. Ranking the shortlist better
+// does not help (tried: match-density normalisation put the true tune at
+// rank <=243 every time, and still lost the same detections).
 pub const QUERY_REPASS_SIZE: usize = 2000;

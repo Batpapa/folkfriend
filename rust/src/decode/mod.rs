@@ -8,6 +8,7 @@ use crate::feature::types::Features;
 use crate::feature::signal;
 use std::fmt;
 use types::{Contour, ContourString, LatticePath};
+pub use contour::{set_note_filter, set_tempo_model, set_tempo_range, ContourDebugFeatures, TempoCandidateScore};
 
 pub struct FeatureDecoder {
     pub sample_rate: u32
@@ -48,5 +49,19 @@ impl FeatureDecoder {
         let mut contour: Contour = contour::contour_from_lattice_path(lattice_path, features, self.sample_rate)?;
         octave::correct_contour_octave(&mut contour);
         return Ok(types::contour_to_contour_string(&contour));
+    }
+
+    // Debug/experimental instrumentation (2026-08-18) — same computation as
+    // `decode_contour`, additionally surfacing the note/tempo features that
+    // are otherwise discarded. Never called from the production transcribe
+    // path (`transcribe_pcm_buffer`); see `lib.rs`'s `transcribe_pcm_buffer_debug`.
+    pub fn decode_contour_debug(
+        &self,
+        lattice_path: &LatticePath,
+        features: &Features
+    ) -> Result<(ContourString, ContourDebugFeatures), DecoderError> {
+        let (mut contour, debug) = contour::contour_from_lattice_path_debug(lattice_path, features, self.sample_rate)?;
+        octave::correct_contour_octave(&mut contour);
+        return Ok((types::contour_to_contour_string(&contour), debug));
     }
 }

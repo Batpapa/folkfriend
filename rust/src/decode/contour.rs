@@ -2,6 +2,45 @@ use crate::decode::types::{Contour, LatticeIndex, LatticePath, Pitch};
 use crate::decode::DecoderError;
 use crate::feature::types::Features;
 use crate::ff_config;
+use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// Tempo search range in crotchets per minute, upper bound exclusive (step 5).
+// Upstream hard-coded 60/240; these defaults keep that exactly.
+static TEMPO_LOW_BPM: AtomicU32 = AtomicU32::new(60);
+static TEMPO_HIGH_BPM: AtomicU32 = AtomicU32::new(240);
+
+/// Cadence ranking study (experiment E1): widen or narrow the tempo search.
+pub fn set_tempo_range(low_bpm: u32, high_bpm: u32) {
+    TEMPO_LOW_BPM.store(low_bpm, Ordering::Relaxed);
+    TEMPO_HIGH_BPM.store(high_bpm, Ordering::Relaxed);
+}
+
+// Note filter, settable for the engine screening. Defaults are
+// ff_config::MIN_NOTE_POWER (f32, stored as its bit pattern) and
+// ff_config::MIN_NOTE_DURATION, so behaviour is unchanged unless set.
+static MIN_NOTE_POWER_BITS: AtomicU32 = AtomicU32::new(0x3DCC_CCCD); // 0.10f32
+static MIN_NOTE_DURATION_FRAMES: AtomicU32 = AtomicU32::new(ff_config::MIN_NOTE_DURATION as u32);
+
+/// Cadence ranking study: minimum note power and duration (frames).
+pub fn set_note_filter(min_power: f32, min_duration_frames: u32) {
+    MIN_NOTE_POWER_BITS.store(min_power.to_bits(), Ordering::Relaxed);
+    MIN_NOTE_DURATION_FRAMES.store(min_duration_frames, Ordering::Relaxed);
+}
+
+// Tempo selection model: probability_model_score = mean(intercept - slope * quavers).
+// Defaults 3.0 / 0.5 (upstream). Hypothesis H6 (2026-09-13): the quantisation term
+// measures rounding error in FRAMES, so a faster candidate tempo (finer grid) always
+// fits better; this linear model is the only counterweight. A steeper slope pushes
+// the choice towards slower tempos.
+static TEMPO_MODEL_INTERCEPT_BITS: AtomicU32 = AtomicU32::new(0x4040_0000); // 3.0f32 (0x40000000 is 2.0 — that slip failed the bit-level control once)
+static TEMPO_MODEL_SLOPE_BITS: AtomicU32 = AtomicU32::new(0x3F00_0000); // 0.5f32
+
+/// Cadence ranking study: intercept and slope of the note-length model.
+pub fn set_tempo_model(intercept: f32, slope: f32) {
+    TEMPO_MODEL_INTERCEPT_BITS.store(intercept.to_bits(), Ordering::Relaxed);
+    TEMPO_MODEL_SLOPE_BITS.store(slope.to_bits(), Ordering::Relaxed);
+}
 
 #[derive(Debug)]
 struct Note {
@@ -21,17 +60,73 @@ struct QuantisedNote {
 }
 type QuantisedNotes = Vec<QuantisedNote>;
 
+// ── Debug/experimental instrumentation (2026-08-18) ─────────────────────────
+// Additive only — every value here was already being computed and discarded
+// (best tempo picked out of 36 candidates, quant/rhythm scores multiplied
+// together before comparison, rejected notes silently dropped by `retain`).
+// Nothing about the values used by the production contour/tempo selection
+// below is changed; this struct is just captured alongside it. See
+// `lib.rs`'s `transcribe_pcm_buffer_debug` for the WASM-exported entry point
+// that surfaces this — the production `transcribe_pcm_buffer` path ignores it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TempoCandidateScore {
+    pub bpm: u32,
+    pub quant_score: f32,
+    pub rhythm_score: f32,
+    pub combined_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContourDebugFeatures {
+    pub note_count_raw: usize,
+    pub note_count_filtered: usize,
+    pub note_count_rejected: usize,
+    pub note_duration_mean: f32,
+    pub note_duration_median: f32,
+    pub note_power_mean: f32,
+    pub note_power_max: f32,
+    pub note_power_median: f32,
+    pub tempo_candidates: Vec<TempoCandidateScore>,
+    pub best_bpm: u32,
+    pub best_quant_score: f32,
+    pub best_rhythm_score: f32,
+    pub best_combined_score: f32,
+    pub contour_length: usize,
+}
+
+fn median(values: &mut Vec<f32>) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
 pub fn contour_from_lattice_path(
     lattice_path: &LatticePath,
     features: &Features,
     sample_rate: u32,
 ) -> Result<Contour, DecoderError> {
+    let (contour, _debug) = contour_from_lattice_path_debug(lattice_path, features, sample_rate)?;
+    return Ok(contour);
+}
+
+pub fn contour_from_lattice_path_debug(
+    lattice_path: &LatticePath,
+    features: &Features,
+    sample_rate: u32,
+) -> Result<(Contour, ContourDebugFeatures), DecoderError> {
     if lattice_path.len() == 0 {
         return Err(DecoderError);
     }
     let mut notes = notes_from_lattice_path(lattice_path, features)?;
-    let contour = contour_from_notes(&mut notes, sample_rate)?;
-    return Ok(contour);
+    let (contour, debug) = contour_from_notes(&mut notes, sample_rate)?;
+    return Ok((contour, debug));
 }
 
 fn notes_from_lattice_path(
@@ -64,10 +159,18 @@ fn notes_from_lattice_path(
     return Ok(notes);
 }
 
-fn contour_from_notes(notes: &mut Notes, sample_rate: u32) -> Result<Contour, DecoderError> {
+fn contour_from_notes(
+    notes: &mut Notes,
+    sample_rate: u32,
+) -> Result<(Contour, ContourDebugFeatures), DecoderError> {
+    let note_count_raw = notes.len();
+
     // Filter out very short events and very weak events.
+    // Settable since 2026-09-13 (set_note_filter); defaults are the ff_config values.
+    let min_note_power = f32::from_bits(MIN_NOTE_POWER_BITS.load(Ordering::Relaxed));
+    let min_note_duration = MIN_NOTE_DURATION_FRAMES.load(Ordering::Relaxed) as usize;
     notes.retain(|note| {
-        note.power > ff_config::MIN_NOTE_POWER && note.duration >= ff_config::MIN_NOTE_DURATION
+        note.power > min_note_power && note.duration >= min_note_duration
     });
 
     // There may be no events left (all silence = all low power = all removed),
@@ -76,6 +179,15 @@ fn contour_from_notes(notes: &mut Notes, sample_rate: u32) -> Result<Contour, De
     if notes.len() <= 3 {
         return Err(DecoderError);
     }
+    let note_count_filtered = notes.len();
+
+    let durations: Vec<f32> = notes.iter().map(|n| n.duration as f32).collect();
+    let powers: Vec<f32> = notes.iter().map(|n| n.power).collect();
+    let note_duration_mean = durations.iter().sum::<f32>() / durations.len() as f32;
+    let note_power_mean = powers.iter().sum::<f32>() / powers.len() as f32;
+    let note_power_max = powers.iter().cloned().fold(f32::MIN, f32::max);
+    let note_duration_median = median(&mut durations.clone());
+    let note_power_median = median(&mut powers.clone());
 
     // We now attempt to convert this filtered sequence of notes into a contour,
     //  which is a sequence of pitches all of which are the same length. We use
@@ -86,18 +198,36 @@ fn contour_from_notes(notes: &mut Notes, sample_rate: u32) -> Result<Contour, De
     //  minums in a row is far less likely). We generally find the solution where
     //  one quaver corresponds to one note in the contour, which is a fair
     //  approximation for the overwhelming majority of folk tunes.
-    let low_bpm = 60;
-    let high_bpm = 240;
+    // Cadence ranking study, 2026-09-13 (experiment E1): the range is settable
+    // from JS so one binary serves the control and the variants. Defaults are
+    // upstream's 60/240, so behaviour is unchanged unless set_tempo_range runs.
+    let low_bpm = TEMPO_LOW_BPM.load(Ordering::Relaxed);
+    let high_bpm = TEMPO_HIGH_BPM.load(Ordering::Relaxed);
 
     let mut best_tempo: (u32, f32, QuantisedNotes) =
         (low_bpm, -f32::INFINITY, QuantisedNotes::new());
+    let mut tempo_candidates: Vec<TempoCandidateScore> = Vec::new();
+    let mut best_candidate = TempoCandidateScore {
+        bpm: low_bpm,
+        quant_score: 0.0,
+        rhythm_score: 0.0,
+        combined_score: -f32::INFINITY,
+    };
 
     for bpm in (low_bpm..high_bpm).step_by(5) {
         let frames_per_quaver = bpm_to_num_frames(bpm, sample_rate);
         let quantised_notes = quantise_notes(&notes, frames_per_quaver)?;
-        let score = score_quantised_notes(&quantised_notes, &notes, frames_per_quaver);
-        if score > best_tempo.1 {
-            best_tempo = (bpm, score, quantised_notes);
+        let scores = score_quantised_notes(&quantised_notes, &notes, frames_per_quaver);
+        let candidate = TempoCandidateScore {
+            bpm,
+            quant_score: scores.0,
+            rhythm_score: scores.1,
+            combined_score: scores.2,
+        };
+        tempo_candidates.push(candidate);
+        if candidate.combined_score > best_tempo.1 {
+            best_tempo = (bpm, candidate.combined_score, quantised_notes);
+            best_candidate = candidate;
         }
     }
 
@@ -107,7 +237,24 @@ fn contour_from_notes(notes: &mut Notes, sample_rate: u32) -> Result<Contour, De
         contour.extend(vec![q_note.pitch; q_note.quavers_quant]);
     }
 
-    return Ok(contour);
+    let debug = ContourDebugFeatures {
+        note_count_raw,
+        note_count_filtered,
+        note_count_rejected: note_count_raw - note_count_filtered,
+        note_duration_mean,
+        note_duration_median,
+        note_power_mean,
+        note_power_max,
+        note_power_median,
+        tempo_candidates,
+        best_bpm: best_candidate.bpm,
+        best_quant_score: best_candidate.quant_score,
+        best_rhythm_score: best_candidate.rhythm_score,
+        best_combined_score: best_candidate.combined_score,
+        contour_length: contour.len(),
+    };
+
+    return Ok((contour, debug));
 }
 
 fn quantise_notes(notes: &Notes, frames_per_quaver: f32) -> Result<QuantisedNotes, DecoderError> {
@@ -136,11 +283,14 @@ fn quantise_notes(notes: &Notes, frames_per_quaver: f32) -> Result<QuantisedNote
     return Ok(quantised_notes);
 }
 
+// Returns (quant_score, probability_model_score, combined_score = product of
+// the two). Previously only the product was ever kept — split out here so
+// each sub-score can be inspected independently (debug instrumentation).
 fn score_quantised_notes(
     quantised_notes: &QuantisedNotes,
     notes: &Notes,
     frames_per_quaver: f32,
-) -> f32 {
+) -> (f32, f32, f32) {
     let num_input_frames: f32 = notes.iter().map(|note| note.duration as f32).sum();
 
     // What is the quantisation error? Scale this by power
@@ -165,17 +315,19 @@ fn score_quantised_notes(
     //  consider the output probability as the product of the individual
     //  probabilities the log likelihood is therefore roughly a sum of these
     //  notes
+    let intercept = f32::from_bits(TEMPO_MODEL_INTERCEPT_BITS.load(Ordering::Relaxed));
+    let slope = f32::from_bits(TEMPO_MODEL_SLOPE_BITS.load(Ordering::Relaxed));
     let mut probability_model_score: f32 = quantised_notes
         .iter()
         // Linear model of log likelihood of notes of different duration
-        .map(|q_note| 3.0 - 0.5 * q_note.quavers_quant as f32)
+        .map(|q_note| intercept - slope * q_note.quavers_quant as f32)
         .sum();
 
     // Normalise by number of quantised quavers, otherwise there's a
     //   bias towards shorter tempos which have more positive scores.
     probability_model_score /= quantised_notes.len() as f32;
 
-    return probability_model_score * quant_score;
+    return (quant_score, probability_model_score, probability_model_score * quant_score);
 }
 
 pub fn bpm_to_num_frames(bpm: u32, sample_rate: u32) -> f32 {

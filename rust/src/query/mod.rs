@@ -1,5 +1,6 @@
 mod heuristic;
 mod nw;
+pub mod nw_simd;
 
 use crate::decode;
 use crate::ff_config;
@@ -15,6 +16,9 @@ pub struct QueryEngine {
     setting_ids_by_tune_id: HashMap<TuneID, Vec<SettingID>>,
     num_repass: usize,
     num_output: usize,
+    /// Queries shorter than this many contour symbols are not scored (empty
+    /// result). 0 = upstream behaviour. See `set_min_query_length`.
+    min_query_length: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +45,7 @@ impl QueryEngine {
             setting_ids_by_tune_id: HashMap::new(),
             num_repass: ff_config::QUERY_REPASS_SIZE,
             num_output: 100,
+            min_query_length: 0,
         }
     }
 
@@ -62,10 +67,30 @@ impl QueryEngine {
         self.tune_index = Some(tune_index);
     }
 
+    /// Size of the shortlist re-aligned by Needleman-Wunsch after the n-gram
+    /// pass. Default ff_config::QUERY_REPASS_SIZE. Larger raises the reported
+    /// score of tunes with many settings (their best setting is more likely to
+    /// be aligned); cost of pass 2 is linear in it.
+    pub fn set_num_repass(&mut self, num_repass: usize) {
+        self.num_repass = num_repass;
+    }
+
+    /// Minimum query length, in contour symbols (one symbol = one quaver).
+    /// Shorter queries return an empty result instead of being scored. Default 0
+    /// (every query scored). Scores are normalised by the SHORTER sequence, so a
+    /// very short contour finds a high-scoring chance alignment somewhere in the
+    /// index — mostly what noise transcribes to.
+    pub fn set_min_query_length(&mut self, min_query_length: usize) {
+        self.min_query_length = min_query_length;
+    }
+
     pub fn run_contour_query(
         self: &Self,
         contour: &decode::types::ContourString,
     ) -> Result<TranscriptionQueryResults, QueryError> {
+        if contour.len() < self.min_query_length {
+            return Ok(Vec::new());
+        }
         match &self.tune_index {
             None => Err(QueryError),
             Some(tune_index) => {
@@ -74,22 +99,71 @@ impl QueryEngine {
                 // First pass: fast, but inaccurate. Good for eliminating many poor candidates.
                 //
                 // let nowh = Instant::now();
-                let mut first_search =
-                    heuristic::run_transcription_query(&contour, &tune_index);
-                first_search.truncate(self.num_repass);
+                let first_search =
+                    heuristic::run_transcription_query(&contour, &tune_index, self.num_repass);
                     // eprintln!("Heuristic search took {:.2?}", nowh.elapsed());
                 //
                 // === Full search ===
                 // Second pass: slow, but accurate. Good for refining a shortlist of candidates.
                 //
                 // let nowf = Instant::now();
-                let mut second_search: Vec<(SettingID, f32)> = Vec::new();
-                for (setting_id, _) in &first_search {
-                    let score = nw::needleman_wunsch(
+                // Alignments run four at a time (see nw_simd.rs) — same
+                // arithmetic, four lanes of one v128, ~4x the throughput on a
+                // loop that is latency-bound rather than throughput-bound.
+                //
+                // Two constraints shape the batching:
+                //   * every lane must share one `n`, so only settings at least
+                //     as long as the query can be batched; the rest go scalar.
+                //   * the SORTED ORDER BELOW IS STABLE, so ties keep the order
+                //     scores were collected in — which the deduplication then
+                //     turns into which setting represents a tune. Batches are
+                //     therefore built by length (to keep the lanes in step) but
+                //     scores are written back at their ORIGINAL index, so the
+                //     collection order is bit-for-bit what it always was.
+                let n_query = contour.len();
+                let mut second_search: Vec<(SettingID, f32)> = first_search
+                    .iter()
+                    .map(|(id, _)| ((*id).clone(), 0.0f32))
+                    .collect();
+
+                let mut batchable: Vec<usize> = Vec::with_capacity(first_search.len());
+                for (i, (setting_id, _)) in first_search.iter().enumerate() {
+                    if tune_index.settings[*setting_id].contour.len() >= n_query && n_query > 0 {
+                        batchable.push(i);
+                    } else {
+                        second_search[i].1 = nw::needleman_wunsch(
+                            &contour,
+                            &tune_index.settings[*setting_id].contour,
+                        );
+                    }
+                }
+                // Group by length so the four lanes finish within a few rows of
+                // each other; the masked tail is what a mismatched batch costs.
+                // Unstable is fine and ~30 KB smaller than the stable sort:
+                // scores are written back at their original index, so how the
+                // batches happen to be grouped cannot reach the output.
+                batchable.sort_unstable_by_key(|&i| {
+                    tune_index.settings[first_search[i].0].contour.len()
+                });
+
+                let mut c = batchable.chunks_exact(4);
+                for chunk in &mut c {
+                    let bs = [
+                        &tune_index.settings[first_search[chunk[0]].0].contour,
+                        &tune_index.settings[first_search[chunk[1]].0].contour,
+                        &tune_index.settings[first_search[chunk[2]].0].contour,
+                        &tune_index.settings[first_search[chunk[3]].0].contour,
+                    ];
+                    let scores = nw_simd::needleman_wunsch_x4(&contour, bs);
+                    for k in 0..4 {
+                        second_search[chunk[k]].1 = scores[k];
+                    }
+                }
+                for &i in c.remainder() {
+                    second_search[i].1 = nw::needleman_wunsch(
                         &contour,
-                        &tune_index.settings[setting_id].contour,
+                        &tune_index.settings[first_search[i].0].contour,
                     );
-                    second_search.push((setting_id.clone(), score));
                 }
                 let mut sorted_rankings: Vec<_> = second_search.into_iter().collect();
                 sorted_rankings.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());

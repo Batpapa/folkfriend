@@ -84,6 +84,23 @@ impl FolkFriend {
         return contour;
     }
 
+    // Debug/experimental instrumentation (2026-08-18) — never called from the
+    // production `transcribe_pcm_buffer` path, purely additive. See
+    // `FolkFriendWASM::transcribe_pcm_buffer_debug`.
+    pub fn transcribe_pcm_buffer_debug(
+        &mut self,
+    ) -> Result<(decode::types::ContourString, decode::ContourDebugFeatures), decode::DecoderError>
+    {
+        let lattice_path = self
+            .feature_decoder
+            .decode_lattice_path(&mut self.feature_extractor.features)?;
+        let result = self
+            .feature_decoder
+            .decode_contour_debug(&lattice_path, &self.feature_extractor.features);
+        self.feature_extractor.flush();
+        return result;
+    }
+
     pub fn run_transcription_query(
         &self,
         contour: &decode::types::ContourString,
@@ -150,6 +167,42 @@ impl FolkFriendWASM {
         self.ff.query_engine.use_tune_index(tune_index);
     }
 
+    // ── Detector parameters ─────────────────────────────────────────────────
+    // The engine is a generic detector: every default below is upstream
+    // FolkFriend's behaviour, and the CALLER sets the values it has tuned
+    // (Cadence: src/session/sessionConfig.ts). With no call, results are
+    // bit-identical to the unparameterised engine.
+
+    /// Tempo search range, crotchets per minute, upper bound exclusive, step 5.
+    /// Default 60 / 240.
+    pub fn set_tempo_range(&mut self, low_bpm: u32, high_bpm: u32) {
+        decode::set_tempo_range(low_bpm, high_bpm);
+    }
+
+    /// Notes weaker than `min_power` or shorter than `min_duration_frames`
+    /// frames are dropped before quantisation. Default 0.10 / 3.
+    pub fn set_note_filter(&mut self, min_power: f32, min_duration_frames: u32) {
+        decode::set_note_filter(min_power, min_duration_frames);
+    }
+
+    /// Tempo selection model: per-note score `intercept - slope * quavers`.
+    /// Default 3.0 / 0.5.
+    pub fn set_tempo_model(&mut self, intercept: f32, slope: f32) {
+        decode::set_tempo_model(intercept, slope);
+    }
+
+    /// Settings re-aligned by Needleman-Wunsch after the n-gram pass.
+    /// Default ff_config::QUERY_REPASS_SIZE (2000).
+    pub fn set_num_repass(&mut self, num_repass: usize) {
+        self.ff.query_engine.set_num_repass(num_repass);
+    }
+
+    /// Queries shorter than this many contour symbols return no candidates.
+    /// Default 0.
+    pub fn set_min_query_length(&mut self, min_query_length: usize) {
+        self.ff.query_engine.set_min_query_length(min_query_length);
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: u32) -> bool {
         match self.ff.set_sample_rate(sample_rate) {
             Ok(()) => true,
@@ -203,6 +256,29 @@ impl FolkFriendWASM {
         }
     }
 
+    // Debug/experimental instrumentation (2026-08-18) — `transcribe_pcm_buffer`
+    // above is completely untouched; this is a new, separate export. Returns
+    // `{"contour": ..., "features": {...}}` on success (features = note/tempo
+    // stats otherwise discarded), or `{"error": ..., "features": null}` on
+    // the same "too few notes" case `transcribe_pcm_buffer` reports as a bare
+    // error — `features: null` here (rather than omitting note/tempo stats
+    // entirely) is deliberate: a noise-study harness needs to know this
+    // window produced literally zero usable notes, not just skip the row.
+    pub fn transcribe_pcm_buffer_debug(&mut self) -> String {
+        match self.ff.transcribe_pcm_buffer_debug() {
+            Ok((transcription, features)) => json!({
+                "contour": transcription,
+                "features": features,
+            })
+            .to_string(),
+            Err(_) => json!({
+                "error": "Could not detect any notes".to_string(),
+                "features": serde_json::Value::Null,
+            })
+            .to_string(),
+        }
+    }
+
     pub fn run_transcription_query(&self, contour_string: &str) -> String {
         // TODO proper error propagation in JSON back to javascript
         let result = self.ff.run_transcription_query(&contour_string.to_string());
@@ -212,6 +288,23 @@ impl FolkFriendWASM {
             //  through a hundred results, even if we do want this sort
             //  of granularity when assessing dataset performance.
             query_result.truncate(20);
+            return json!(query_result).to_string();
+        } else {
+            return json!({
+                "error": "Transcription query error".to_string()
+            })
+            .to_string();
+        }
+    }
+
+    // Debug/experimental instrumentation (2026-08-18) — identical query to
+    // `run_transcription_query` above (same `QueryEngine::run_contour_query`
+    // call, already computes/sorts up to `num_output`=100 scored settings
+    // internally), just without the `.truncate(20)` applied for the
+    // production UI. `run_transcription_query` is completely untouched.
+    pub fn run_transcription_query_debug(&self, contour_string: &str) -> String {
+        let result = self.ff.run_transcription_query(&contour_string.to_string());
+        if let Ok(query_result) = result {
             return json!(query_result).to_string();
         } else {
             return json!({
