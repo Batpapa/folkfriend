@@ -279,6 +279,23 @@ impl FolkFriendWASM {
         }
     }
 
+    // Score following (Cadence, 2026-10-28) — additive, like the `_debug`
+    // exports: hands the per-frame pitch energies fed so far to JS, row-major
+    // (frames × MIDI_NUM, MIDI_LOW first), undecoded and unnormalised, then
+    // flushes them. Lets the caller align a whole performance against a known
+    // score instead of transcribing it. Production paths untouched.
+    pub fn take_features(&mut self) -> js_sys::Float32Array {
+        let flat: Vec<f32> = self
+            .ff
+            .feature_extractor
+            .features
+            .iter()
+            .flat_map(|frame| frame.iter().copied())
+            .collect();
+        self.ff.feature_extractor.flush();
+        js_sys::Float32Array::from(&flat[..])
+    }
+
     pub fn run_transcription_query(&self, contour_string: &str) -> String {
         // TODO proper error propagation in JSON back to javascript
         let result = self.ff.run_transcription_query(&contour_string.to_string());
