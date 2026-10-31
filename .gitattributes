@@ -9,3 +9,4 @@
 *.gz binary
 *.bin binary
 *.wasm binary
+*.wav binary
