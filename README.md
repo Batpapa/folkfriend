@@ -1,6 +1,21 @@
 # FolkFriend
 Scripts and Web Application for folk music tune transcription and recognition.
 
+> **This is a modified version of [FolkFriend](https://github.com/TomWyllie/folkfriend) by Tom Wyllie**, maintained for [Cadence](https://github.com/batpapa/cadence). Modified since 2026-08-18; licensed, like the original, under the GNU GPL v3 (see `LICENSE`).
+>
+> Changes, all in `rust/` (see the commit history for details):
+> - debug exports returning the transcribed contour, note/tempo statistics and the untruncated candidate list;
+> - a faster engine (Needleman-Wunsch, n-gram pass, per-frame path, optional `simd128` kernel), with byte-identical results except for one rounding change;
+> - caller-set detector parameters (`set_tempo_range`, `set_num_repass`, `set_min_query_length`, `set_note_filter`, `set_tempo_model`), defaulting to upstream behaviour;
+> - `take_features`, which returns raw pitch energies for score following.
+>
+> Building the WebAssembly module (from `rust/`):
+> ```sh
+> wasm-pack build --target web --release                                 # folkfriend_bg.wasm
+> RUSTFLAGS="-C target-feature=+simd128" wasm-pack build --target web --release --out-dir pkg-simd
+> ```
+> Each Cadence release names the commit its `folkfriend_bg.wasm` is built from; the commit messages give the MD5 of the module they reproduce.
+
 This is the Github repository for the FolkFriend app, for advanced users and developers of the app. If you are looking to simply use the web version of the app please instead go to [folkfriend.app](https://folkfriend.app). 
 
 # Dependencies
