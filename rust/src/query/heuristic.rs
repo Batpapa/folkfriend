@@ -2,6 +2,7 @@ use crate::ff_config;
 use crate::index::schema::*;
 use crate::index::TuneIndex;
 use aho_corasick::{AhoCorasick, Match};
+use std::collections::HashMap;
 
 pub struct ScoredName {
     pub tune_id: TuneID,
@@ -131,6 +132,153 @@ pub fn run_transcription_query<'a>(
     }
     ranked.sort_unstable_by(cmp);
     ranked
+}
+
+/// The n-gram pass of a pitch-class query ('a'..'l', index folded alike) in all twelve keys at
+/// once (Cadence, 2026-11-07). Every query 4-gram is moved down r = 0..11 semitones; a setting's
+/// gram equal to a gram moved down r counts for the transposition r (the query is the setting r
+/// semitones up). The pass over the index is then run_transcription_query's own (rolling 4-byte
+/// code, Bloom filter, lookup on hits), and scores the twelve transpositions of every setting
+/// at once; r = 0 is exactly run_transcription_query's score.
+///
+/// Returns run_transcription_query's own top_n (r = 0, same order — the written key's
+/// shortlist is untouched), then the best `extra` (setting, r != 0) pairs, best first (ties:
+/// setting id, then r). Falls back to the written key alone when the query has fewer than 4
+/// symbols or any outside 'a'..'l'.
+pub fn run_transcription_query_any_key<'a>(
+    query: &String,
+    tune_index: &'a TuneIndex,
+    top_n: usize,
+    extra: usize,
+) -> Vec<(&'a SettingID, u8)> {
+    let q: Vec<u8> = query.bytes().map(|b| b.wrapping_sub(b'a')).collect();
+    if q.len() < ff_config::QUERY_NGRAM_SIZE_CONTOUR || q.iter().any(|&c| c >= 12) {
+        return run_transcription_query(query, tune_index, top_n).into_iter().map(|(id, _)| (id, 0)).collect();
+    }
+    // Every query gram moved down r = 0..11 semitones, as the 4-byte code a setting's gram has
+    // when it matches the query r semitones up; per code, the (r, count) it scores.
+    let mut by_code: HashMap<u32, [u32; 12]> = HashMap::new();
+    for i in 0..=q.len() - 4 {
+        for r in 0..12u8 {
+            let mut code: u32 = 0;
+            for k in 0..4 {
+                code = (code << 8) | (b'a' + (q[i + k] + 12 - r) % 12) as u32;
+            }
+            by_code.entry(code).or_insert([0; 12])[r as usize] += 1;
+        }
+    }
+    // A gram of four pitch classes packed four bits a class: one of 2^16 codes, rolled with a
+    // shift, an or and a mask — no arithmetic chained from one symbol to the next, which a
+    // base-12 index costs (its multiply-and-modulo alone took twice the written key's whole
+    // pass over the 12.5 million symbols of the index). `present` (8 KB, one bit per code,
+    // stays in the fastest cache) says whether the query has it in some key; `slot` then gives
+    // the range of its (r, count) entries (2026-11-08: it replaced a Bloom filter and a hashed
+    // lookup). The entries are the same, so the scores are.
+    const CODES: usize = 1 << 16;
+    let pack = |code: u32| -> usize {
+        let b = code.to_be_bytes();
+        ((b[0] - b'a') as usize) << 12 | ((b[1] - b'a') as usize) << 8 | ((b[2] - b'a') as usize) << 4 | (b[3] - b'a') as usize
+    };
+    let mut present: Vec<u64> = vec![0; CODES / 64];
+    let mut slot: Vec<u16> = vec![0; CODES];
+    let mut ranges: Vec<(u32, u32)> = vec![(0, 0)];
+    let mut entries: Vec<(u8, u32)> = Vec::new();
+    for (code, per_r) in &by_code {
+        let from = entries.len() as u32;
+        for r in 0..12u8 {
+            if per_r[r as usize] > 0 {
+                entries.push((r, per_r[r as usize]));
+            }
+        }
+        let g = pack(*code);
+        slot[g] = ranges.len() as u16;
+        ranges.push((from, entries.len() as u32));
+        present[g >> 6] |= 1u64 << (g & 63);
+    }
+
+    // The other keys' scores, every setting's, and how many (setting, r != 0) pairs reach each
+    // score: the best `extra` pairs are then everything above the score where the count
+    // reaches `extra`, and the best of the ties at it by (id, r) — the very set and order a
+    // bounded heap kept (score down, then id, then r), without its comparisons, most of
+    // them between ids of equal scores (2026-11-08).
+    let mut other: Vec<[u32; 11]> = Vec::with_capacity(if extra > 0 { tune_index.grams.ids.len() } else { 0 });
+    let mut count_at: Vec<u32> = Vec::new();
+
+    // The settings' grams, computed when the index was folded (PitchClassGrams). NO_GRAM's bit
+    // is never set: no query gram is it.
+    let grams = &tune_index.grams;
+    let mut written: Vec<(&'a SettingID, usize)> = Vec::with_capacity(grams.ids.len());
+    for (i, setting_id) in grams.ids.iter().enumerate() {
+        let mut sc = [0usize; 12];
+        for &code in &grams.codes[grams.starts[i] as usize..grams.starts[i + 1] as usize] {
+            let code = code as usize;
+            if present[code >> 6] & (1u64 << (code & 63)) != 0 {
+                let (from, to) = ranges[slot[code] as usize];
+                for &(r, m) in &entries[from as usize..to as usize] {
+                    sc[r as usize] += m as usize;
+                }
+            }
+        }
+        written.push((setting_id, sc[0]));
+        if extra > 0 {
+            let mut o = [0u32; 11];
+            for r in 1..12 {
+                let v = sc[r];
+                o[r - 1] = v as u32;
+                if v > 0 {
+                    if v >= count_at.len() {
+                        count_at.resize(v + 1, 0);
+                    }
+                    count_at[v] += 1;
+                }
+            }
+            other.push(o);
+        }
+    }
+    // The score of the extra-th best pair (`floor`) and how many of the pairs AT it are kept.
+    let mut floor = 1usize;
+    let mut at_floor = usize::MAX;
+    let mut above = 0usize;
+    for v in (1..count_at.len()).rev() {
+        let c = count_at[v] as usize;
+        if above + c >= extra {
+            floor = v;
+            at_floor = extra - above;
+            break;
+        }
+        above += c;
+    }
+    let mut kept: Vec<(usize, &'a SettingID, u8)> = Vec::new();
+    let mut ties: Vec<(&'a SettingID, u8)> = Vec::new();
+    if extra > 0 {
+        for (i, o) in other.iter().enumerate() {
+            for (k, &v) in o.iter().enumerate() {
+                let v = v as usize;
+                if v > floor {
+                    kept.push((v, written[i].0, k as u8 + 1));
+                } else if v == floor {
+                    ties.push((written[i].0, k as u8 + 1));
+                }
+            }
+        }
+        // the ties kept: smallest id, then smallest r
+        if ties.len() > at_floor {
+            ties.select_nth_unstable_by(at_floor, |x, y| x.0.cmp(y.0).then_with(|| x.1.cmp(&y.1)));
+            ties.truncate(at_floor);
+        }
+        kept.extend(ties.into_iter().map(|(id, r)| (floor, id, r)));
+        kept.sort_unstable_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(y.1)).then_with(|| x.2.cmp(&y.2)));
+    }
+    // the written key exactly as run_transcription_query ranks it
+    let cmp = |x: &(&SettingID, usize), y: &(&SettingID, usize)| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0));
+    if written.len() > top_n {
+        written.select_nth_unstable_by(top_n, cmp);
+        written.truncate(top_n);
+    }
+    written.sort_unstable_by(cmp);
+    let mut out: Vec<(&'a SettingID, u8)> = written.into_iter().map(|(id, _)| (id, 0)).collect();
+    out.extend(kept.into_iter().map(|(_, id, r)| (id, r)));
+    out
 }
 
 pub fn run_name_query(query: &String, tune_index: &TuneIndex) -> Vec<ScoredName> {

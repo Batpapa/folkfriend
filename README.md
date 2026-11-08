@@ -8,6 +8,9 @@ Scripts and Web Application for folk music tune transcription and recognition.
 > - a faster engine (Needleman-Wunsch, n-gram pass, per-frame path, optional `simd128` kernel), with byte-identical results except for one rounding change;
 > - caller-set detector parameters (`set_tempo_range`, `set_num_repass`, `set_min_query_length`, `set_note_filter`, `set_tempo_model`), defaulting to upstream behaviour;
 > - `take_features`, which returns raw pitch energies for score following.
+> - `set_pitch_class_mode` (per instance, one-way): harmonic/percussive separation, drone removal, octaves summed into 12 pitch classes before the melody is followed, index folded to match (`rust/src/feature/pitch_class.rs`); the default path is untouched.
+> - in that mode, `set_any_pitch` (per instance, off by default): each window's tuning estimated and corrected, and the tune looked for in all twelve keys (`pitch_class::window_tuning`, `query/heuristic.rs::run_transcription_query_any_key`);
+> - `enable_clean_features` / `take_clean_features`: the pitch-class engine's cleaned 48-note energies, streamed, drone removed, strongest notes kept — for score following (`rust/src/feature/clean.rs`).
 >
 > Building the WebAssembly module (from `rust/`):
 > ```sh

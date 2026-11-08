@@ -25,6 +25,7 @@ pub struct FolkFriend {
     query_engine: query::QueryEngine,
     feature_extractor: feature::FeatureExtractor,
     feature_decoder: decode::FeatureDecoder,
+    pitch_class_mode: bool,
 }
 
 impl FolkFriend {
@@ -34,6 +35,7 @@ impl FolkFriend {
             feature_extractor: feature::FeatureExtractor::new(ff_config::SAMPLE_RATE_DEFAULT)
                 .unwrap(),
             feature_decoder: decode::FeatureDecoder::new(ff_config::SAMPLE_RATE_DEFAULT).unwrap(),
+            pitch_class_mode: false,
         }
     }
 
@@ -52,6 +54,7 @@ impl FolkFriend {
     ) -> Result<(), feature::signal::SampleRateError> {
         if self.feature_extractor.sample_rate != sample_rate {
             self.feature_extractor = feature::FeatureExtractor::new(sample_rate)?;
+            self.feature_extractor.pitch_class_mode = self.pitch_class_mode;
         }
         if self.feature_decoder.sample_rate != sample_rate {
             self.feature_decoder = decode::FeatureDecoder::new(sample_rate)?;
@@ -71,9 +74,42 @@ impl FolkFriend {
         self.feature_extractor.flush();
     }
 
+    /// Switches this instance to pitch-class recognition (feature/pitch_class.rs):
+    /// transcriptions become pitch-class contours and the index is folded to
+    /// match, now or when loaded. One-way, per instance: an instance that also
+    /// serves take_features (score following, tempo) must stay in the default mode.
+    pub fn set_pitch_class_mode(&mut self) {
+        self.pitch_class_mode = true;
+        self.feature_extractor.pitch_class_mode = true;
+        self.feature_extractor.flush();
+        self.query_engine.use_pitch_classes();
+    }
+
+    /// Pitch-class mode (Cadence, 2026-11-07): "any pitch" — each window's tuning estimated and
+    /// corrected (a session tuned up to a quarter-tone off A = 440 lands on the notes again) and
+    /// the tune looked for in all twelve keys (one played in another key than the index's).
+    /// Measured: off the written pitch (a quarter-tone up) 91/96 tunes instead of 8/96; at the
+    /// written pitch the same tunes and false positives, with a few more wrong names shown for
+    /// a moment; about 1.5x the time of a window. Off by default.
+    pub fn set_any_pitch(&mut self, on: bool) {
+        self.feature_extractor.pitch_class_tuning = on;
+        self.query_engine.set_any_key(on);
+    }
+
+    fn transcribe_pitch_classes(
+        &mut self,
+    ) -> Result<(decode::types::ContourString, decode::ContourDebugFeatures), decode::DecoderError> {
+        let mut features = self.feature_extractor.pitch_class_features();
+        self.feature_extractor.flush();
+        self.feature_decoder.decode_pitch_class_contour(&mut features)
+    }
+
     pub fn transcribe_pcm_buffer(
         &mut self,
     ) -> Result<decode::types::ContourString, decode::DecoderError> {
+        if self.pitch_class_mode {
+            return self.transcribe_pitch_classes().map(|(contour, _)| contour);
+        }
         let lattice_path = self
             .feature_decoder
             .decode_lattice_path(&mut self.feature_extractor.features)?;
@@ -91,6 +127,9 @@ impl FolkFriend {
         &mut self,
     ) -> Result<(decode::types::ContourString, decode::ContourDebugFeatures), decode::DecoderError>
     {
+        if self.pitch_class_mode {
+            return self.transcribe_pitch_classes();
+        }
         let lattice_path = self
             .feature_decoder
             .decode_lattice_path(&mut self.feature_extractor.features)?;
@@ -203,6 +242,13 @@ impl FolkFriendWASM {
         self.ff.query_engine.set_min_query_length(min_query_length);
     }
 
+    /// Pitch-class recognition (Cadence, 2026-11-07), one-way: see
+    /// FolkFriend::set_pitch_class_mode. Contours this instance returns are then
+    /// pitch classes ('a' = C ... 'l' = B) and its index is folded to match.
+    pub fn set_pitch_class_mode(&mut self) {
+        self.ff.set_pitch_class_mode();
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: u32) -> bool {
         match self.ff.set_sample_rate(sample_rate) {
             Ok(()) => true,
@@ -294,6 +340,40 @@ impl FolkFriendWASM {
             .collect();
         self.ff.feature_extractor.flush();
         js_sys::Float32Array::from(&flat[..])
+    }
+
+    /// Score following (Cadence, 2026-11-07, feature/clean.rs): from now on this instance
+    /// streams the frames it is fed into cleaned 48-note energies — the harmonic part, as the
+    /// pitch-class engine reads it — instead of take_features'. Measured on Cadence's
+    /// annotated sessions (experiments/score-follow): with take_clean_features(10 s of
+    /// frames, false, 1 s, 3), 17 tunes followed over less than 80 % of their span instead of
+    /// 20, the ends nearer the annotations, the passes more regular, and a wrong score
+    /// claiming 12 % of a span at the 90th percentile instead of 89 % — in a long recording,
+    /// half as many tunes found that were never played.
+    pub fn enable_clean_features(&mut self) {
+        self.ff.feature_extractor.flush();
+        self.ff.feature_extractor.clean_mode = true;
+    }
+
+    /// The cleaned frames fed since the last call (frames x 48, as take_features): each note
+    /// minus its median over `drone_frames` frames (centred, or the frames up to it when
+    /// `causal`; 0 = nothing removed), the median taken every `stride` frames, then the
+    /// `top_k` strongest notes of each frame kept (0 = all). Flushes.
+    pub fn take_clean_features(&mut self, drone_frames: usize, causal: bool, stride: usize, top_k: usize) -> js_sys::Float32Array {
+        let fe = &mut self.ff.feature_extractor;
+        let mut frames = fe.clean.finish(&fe.fft, &fe.interp_inds);
+        feature::clean::remove_drone_sliding(&mut frames, drone_frames, causal, stride);
+        for f in frames.iter_mut() {
+            feature::clean::keep_strongest(f, top_k);
+        }
+        let flat: Vec<f32> = frames.iter().flat_map(|f| f.iter().copied()).collect();
+        js_sys::Float32Array::from(&flat[..])
+    }
+
+    /// Pitch-class mode: recognise a tune whatever the key and the tuning it is played in (on),
+    /// or at the index's own pitch (off, the default). See FolkFriend::set_any_pitch.
+    pub fn set_any_pitch(&mut self, on: bool) {
+        self.ff.set_any_pitch(on);
     }
 
     pub fn run_transcription_query(&self, contour_string: &str) -> String {

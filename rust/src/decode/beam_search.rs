@@ -126,3 +126,70 @@ pub fn decode(features: &mut Features) -> Result<LatticePath, DecoderError> {
 //         assert!(decode(&mut empty_feats, &pm, &tm).is_err());
 //     }
 // }
+
+/// Pitch-class lattice (Cadence, 2026-11-07): the same dynamic programming as `decode`, over
+/// the 12 pitch classes held in each frame's first 12 slots (feature/pitch_class.rs). An
+/// interval is only known modulo the octave there, so a step of d semitones scores as the
+/// likelier of +d and d-12 under the same pitch model (a rising fourth and a falling fifth
+/// land on the same class). Staying on a class scores BASE_ENERGY_SCORE, as staying on a note
+/// does. Same tie rules as `decode`: the first best predecessor wins, the last best final
+/// state wins.
+pub fn decode_pitch_classes(features: &mut Features) -> Result<LatticePath, DecoderError> {
+    const S: usize = 12;
+    let feature_energy_by_frame = features.energy_by_frame();
+    let total_energy: f32 = feature_energy_by_frame.iter().sum();
+    if total_energy == 0.0 {
+        return Err(DecoderError);
+    }
+    features.normalise(&feature_energy_by_frame);
+    if features.len() < 5 {
+        return Err(DecoderError);
+    }
+
+    let pitch_model = PitchModel::new();
+    let mut transition = [0f32; S * S];
+    for from in 0..S {
+        for to in 0..S {
+            let d = to as PitchInterval - from as PitchInterval;
+            transition[from * S + to] = if d == 0 {
+                pitch_model.score(&0)
+            } else {
+                let up = ((d % 12) + 12) % 12;
+                pitch_model.score(&up).max(pitch_model.score(&(up - 12)))
+            };
+        }
+    }
+
+    let mut lattice: Vec<[f32; S]> = Vec::with_capacity(features.len());
+    let mut first = [0f32; S];
+    first.copy_from_slice(&features[0][..S]);
+    lattice.push(first);
+    for frame in 1..features.len() {
+        let prev = lattice[frame - 1];
+        let mut next = [-f32::INFINITY; S];
+        for to in 0..S {
+            let energy = features[frame][to];
+            for from in 0..S {
+                let proposed = prev[from] + transition[from * S + to] + energy;
+                if proposed > next[to] {
+                    next[to] = proposed;
+                }
+            }
+        }
+        lattice.push(next);
+    }
+
+    let mut path = LatticePath::with_capacity(features.len());
+    for row in lattice.iter() {
+        let mut best = 0usize;
+        let mut best_score = f32::NEG_INFINITY;
+        for (i, score) in row.iter().enumerate() {
+            if *score >= best_score {
+                best_score = *score;
+                best = i;
+            }
+        }
+        path.push(best);
+    }
+    Ok(path)
+}

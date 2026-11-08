@@ -51,6 +51,20 @@ impl FeatureDecoder {
         return Ok(types::contour_to_contour_string(&contour));
     }
 
+    /// Pitch-class transcription (Cadence, 2026-11-07): features from
+    /// feature::pitch_class, lattice over 12 classes, the default note/tempo
+    /// stage. No octave correction: the contour has no octave. Its symbols are
+    /// the first twelve ('a' = C ... 'l' = B), to be queried against an index
+    /// folded the same way (QueryEngine::use_pitch_classes).
+    pub fn decode_pitch_class_contour(
+        &self,
+        features: &mut Features
+    ) -> Result<(ContourString, ContourDebugFeatures), DecoderError> {
+        let lattice_path = beam_search::decode_pitch_classes(features)?;
+        let (contour, debug) = contour::contour_from_lattice_path_debug(&lattice_path, features, self.sample_rate)?;
+        return Ok((types::contour_to_contour_string(&contour), debug));
+    }
+
     // Debug/experimental instrumentation (2026-08-18) — same computation as
     // `decode_contour`, additionally surfacing the note/tempo features that
     // are otherwise discarded. Never called from the production transcribe

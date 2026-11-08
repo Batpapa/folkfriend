@@ -101,3 +101,26 @@ pub const QUERY_NGRAM_SIZE_NAME: usize = 3;     // "trigram"
 // does not help (tried: match-density normalisation put the true tune at
 // rank <=243 every time, and still lost the same detections).
 pub const QUERY_REPASS_SIZE: usize = 2000;
+
+// ======================================================
+// === Pitch-class recognition (Cadence, 2026-11-07) ===
+// ======================================================
+// Used only once a FolkFriend instance is switched to pitch classes
+// (FolkFriend::set_pitch_class_mode); see feature/pitch_class.rs. Chosen on Cadence's
+// development sessions, each in the middle of a plateau, then confirmed on sessions held
+// out of that choice.
+
+// Harmonic/percussive separation: median filter lengths, frames (9 x 21 ms = 190 ms,
+// shorter than a reel's quaver would erase quick notes) and FFT bins (9 x 47 Hz).
+pub const PC_HPSS_TIME_FRAMES: usize = 9;
+pub const PC_HPSS_FREQ_BINS: usize = 9;
+// Fraction of each note's median energy over the window removed as drone / background.
+pub const PC_DRONE_FRACTION: f32 = 1.0;
+// Pitch classes kept per frame (3 loses the melody under accompaniment, 12 drowns it).
+pub const PC_RETAINED_CLASSES: usize = 5;
+/// Pitch-class query in every key (2026-11-07): besides the QUERY_REPASS_SIZE settings the
+/// written key's n-gram pass keeps, the best this many (setting, transposition) pairs of the
+/// other eleven keys are aligned too (query/heuristic.rs, run_transcription_query_any_key).
+/// 1000 measured as good as 2000 (in tune: 675/698 FP 14 vs 674 FP 13; a quarter-tone sharp:
+/// 92/96 vs 91/96), 500 not (a quarter-tone sharp: twice the wrong names shown for a moment).
+pub const PC_ANY_KEY_EXTRA: usize = 1000;

@@ -19,6 +19,10 @@ pub struct QueryEngine {
     /// Queries shorter than this many contour symbols are not scored (empty
     /// result). 0 = upstream behaviour. See `set_min_query_length`.
     min_query_length: usize,
+    /// Index contours folded onto the 12 pitch classes (see use_pitch_classes).
+    pitch_classes: bool,
+    /// Pitch-class queries look in every key (see set_any_key).
+    any_key: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +31,9 @@ pub struct TranscriptionQueryRecord {
     pub setting: Setting,
     pub display_name: String,
     pub score: f32,
+    /// The key the tune was found in (2026-11-07): the recording plays it this many semitones
+    /// ABOVE the setting as written, modulo the octave (0-11). Always 0 outside the any-key query.
+    pub transpose: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,7 +53,36 @@ impl QueryEngine {
             num_repass: ff_config::QUERY_REPASS_SIZE,
             num_output: 100,
             min_query_length: 0,
+            pitch_classes: false,
+            any_key: false,
         }
+    }
+
+    /// Pitch-class mode (Cadence, 2026-11-07): every setting's contour is folded
+    /// onto the 12 pitch classes, now and for any index loaded later, so that
+    /// pitch-class transcriptions are compared like with like. One-way: a
+    /// folded index cannot be unfolded, load it again in a fresh engine.
+    pub fn use_pitch_classes(&mut self) {
+        let already = self.pitch_classes;
+        self.pitch_classes = true;
+        if already {
+            return;
+        }
+        if let Some(index) = self.tune_index.as_mut() {
+            for setting in index.settings.values_mut() {
+                setting.contour = crate::feature::pitch_class::fold_contour_string(&setting.contour);
+            }
+            index.build_pitch_class_grams();
+        }
+    }
+
+    /// Pitch-class mode only (Cadence, 2026-11-07): queries also look in the eleven other
+    /// keys (heuristic::run_transcription_query_any_key) — a session played in another key
+    /// than the index's, or tuned a quarter-tone off, is then recognised without being told.
+    /// Off by default: on sessions in the written key it finds the same tunes, but shows a few
+    /// more wrong names for a moment.
+    pub fn set_any_key(&mut self, on: bool) {
+        self.any_key = on;
     }
 
     pub fn use_tune_index(&mut self, tune_index: TuneIndex) {
@@ -65,6 +101,15 @@ impl QueryEngine {
 
         self.setting_ids_by_tune_id = setting_ids_by_tune_id;
         self.tune_index = Some(tune_index);
+        if self.pitch_classes {
+            // a freshly loaded index is unfolded whatever the mode: fold it
+            if let Some(index) = self.tune_index.as_mut() {
+                for setting in index.settings.values_mut() {
+                    setting.contour = crate::feature::pitch_class::fold_contour_string(&setting.contour);
+                }
+                index.build_pitch_class_grams();
+            }
+        }
     }
 
     /// Size of the shortlist re-aligned by Needleman-Wunsch after the n-gram
@@ -99,9 +144,25 @@ impl QueryEngine {
                 // First pass: fast, but inaccurate. Good for eliminating many poor candidates.
                 //
                 // let nowh = Instant::now();
-                let first_search =
-                    heuristic::run_transcription_query(&contour, &tune_index, self.num_repass);
+                // Pitch-class mode looks in every key (2026-11-07): the written key's
+                // shortlist, untouched, plus the best pairs (setting, transposition r) of
+                // the other keys; each pair is aligned against the query moved down r.
+                let first_search: Vec<(&SettingID, u8)> = if self.pitch_classes && self.any_key {
+                    heuristic::run_transcription_query_any_key(&contour, &tune_index, self.num_repass, ff_config::PC_ANY_KEY_EXTRA)
+                } else {
+                    heuristic::run_transcription_query(&contour, &tune_index, self.num_repass)
+                        .into_iter()
+                        .map(|(id, _)| (id, 0))
+                        .collect()
+                };
                     // eprintln!("Heuristic search took {:.2?}", nowh.elapsed());
+                let keys: Vec<String> = if self.pitch_classes && self.any_key {
+                    (0..12u8)
+                        .map(|r| contour.bytes().map(|b| (b'a' + (b.wrapping_sub(b'a') % 12 + 12 - r) % 12) as char).collect())
+                        .collect()
+                } else {
+                    vec![contour.clone()]
+                };
                 //
                 // === Full search ===
                 // Second pass: slow, but accurate. Good for refining a shortlist of candidates.
@@ -126,8 +187,12 @@ impl QueryEngine {
                     .map(|(id, _)| ((*id).clone(), 0.0f32))
                     .collect();
 
+                for (r, contour) in keys.iter().enumerate() {
                 let mut batchable: Vec<usize> = Vec::with_capacity(first_search.len());
-                for (i, (setting_id, _)) in first_search.iter().enumerate() {
+                for (i, (setting_id, rr)) in first_search.iter().enumerate() {
+                    if *rr as usize != r {
+                        continue;
+                    }
                     if tune_index.settings[*setting_id].contour.len() >= n_query && n_query > 0 {
                         batchable.push(i);
                     } else {
@@ -146,7 +211,16 @@ impl QueryEngine {
                     tune_index.settings[first_search[i].0].contour.len()
                 });
 
-                let mut c = batchable.chunks_exact(4);
+                // Eight at a time first (16-bit lanes, 2026-11-08), then four, then one.
+                let mut c8 = batchable.chunks_exact(8);
+                for chunk in &mut c8 {
+                    let bs: [&String; 8] = std::array::from_fn(|k| &tune_index.settings[first_search[chunk[k]].0].contour);
+                    let scores = nw_simd::needleman_wunsch_x8(&contour, bs);
+                    for k in 0..8 {
+                        second_search[chunk[k]].1 = scores[k];
+                    }
+                }
+                let mut c = c8.remainder().chunks_exact(4);
                 for chunk in &mut c {
                     let bs = [
                         &tune_index.settings[first_search[chunk[0]].0].contour,
@@ -165,13 +239,18 @@ impl QueryEngine {
                         &tune_index.settings[first_search[i].0].contour,
                     );
                 }
-                let mut sorted_rankings: Vec<_> = second_search.into_iter().collect();
+                }
+                let mut sorted_rankings: Vec<(SettingID, f32, u8)> = second_search
+                    .into_iter()
+                    .zip(first_search.iter())
+                    .map(|((id, score), (_, r))| (id, score, *r))
+                    .collect();
                 sorted_rankings.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
                 let mut results: TranscriptionQueryResults = Vec::new();
 
                 let mut tune_ids_in_results: HashSet<TuneID> = HashSet::default();
 
-                for (setting_id, score) in sorted_rankings.iter() {
+                for (setting_id, score, r) in sorted_rankings.iter() {
                     let setting = &tune_index.settings[setting_id];
                     if tune_ids_in_results.contains(&setting.tune_id) {
                         continue;
@@ -182,6 +261,7 @@ impl QueryEngine {
                         setting_id: setting_id.clone(),
                         setting: setting.clone(),
                         score: *score,
+                        transpose: *r,
                         display_name: tune_index.aliases.get(&setting.tune_id).unwrap()[0].clone(),
                     });
 
