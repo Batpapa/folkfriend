@@ -285,7 +285,8 @@ pub fn window_tuning(acs: &[Vec<f32>], sample_rate: u32) -> f32 {
 
 /// harmonic_note_energies, retuned: each note's energy read `window_tuning` semitones off
 /// the equal-tempered grid, so a session tuned off A = 440 lands on the notes again.
-pub(crate) fn tuned_harmonic_note_energies(mags: &[Vec<f32>], fft: &Radix4<f32>, sample_rate: u32) -> Vec<Frame> {
+/// Returns the tuning it read the notes at as well.
+pub(crate) fn tuned_harmonic_note_energies(mags: &[Vec<f32>], fft: &Radix4<f32>, sample_rate: u32) -> (Vec<Frame>, f32) {
     let mut acs: Vec<Vec<f32>> = Vec::with_capacity(mags.len());
     let half = ff_config::SPEC_WINDOW_SIZE / 2;
     for_each_harmonic_buffer(mags, fft, |buffer| {
@@ -297,7 +298,8 @@ pub(crate) fn tuned_harmonic_note_energies(mags: &[Vec<f32>], fft: &Radix4<f32>,
     let bins: Vec<Reading> = (0..ff_config::SPEC_BINS_NUM as usize)
         .map(|b| reading(ff_config::MIDI_LOW as f32 - edge + b as f32 / per + delta, sample_rate))
         .collect();
-    acs.iter()
+    let frames = acs
+        .iter()
         .map(|ac| {
             let mut fr: Frame = [0.; N];
             for (b, r) in bins.iter().enumerate() {
@@ -305,7 +307,8 @@ pub(crate) fn tuned_harmonic_note_energies(mags: &[Vec<f32>], fft: &Radix4<f32>,
             }
             fr
         })
-        .collect()
+        .collect();
+    (frames, delta)
 }
 
 fn remove_drone(frames: &mut Vec<Frame>) {
@@ -338,15 +341,19 @@ fn keep_strongest(frame: &mut Frame, len: usize, k: usize) {
 }
 
 /// One window's pitch-class features: frame k holds the energies of the 12 classes in
-/// its first 12 slots (C first: MIDI_LOW is a C), the rest zero.
-pub fn features_from_magnitudes(mags: &[Vec<f32>], fft: &Radix4<f32>, interp: &InterpInds, tuning: Option<u32>) -> Features {
-    let mut frames = match tuning {
+/// its first 12 slots (C first: MIDI_LOW is a C), the rest zero. With `tuning`, also the
+/// tuning the window was read at (window_tuning).
+pub fn features_from_magnitudes(mags: &[Vec<f32>], fft: &Radix4<f32>, interp: &InterpInds, tuning: Option<u32>) -> (Features, Option<f32>) {
+    let (mut frames, delta) = match tuning {
         // any pitch (FolkFriend::set_any_pitch): read the notes where this window's tuning puts them
-        Some(sample_rate) => tuned_harmonic_note_energies(mags, fft, sample_rate),
-        None => harmonic_note_energies(mags, fft, interp),
+        Some(sample_rate) => {
+            let (frames, delta) = tuned_harmonic_note_energies(mags, fft, sample_rate);
+            (frames, Some(delta))
+        }
+        None => (harmonic_note_energies(mags, fft, interp), None),
     };
     remove_drone(&mut frames);
-    frames
+    let features = frames
         .iter()
         .map(|fr| {
             let mut pc: Frame = [0.; N];
@@ -356,7 +363,8 @@ pub fn features_from_magnitudes(mags: &[Vec<f32>], fft: &Radix4<f32>, interp: &I
             keep_strongest(&mut pc, 12, ff_config::PC_RETAINED_CLASSES);
             pc
         })
-        .collect()
+        .collect();
+    (features, delta)
 }
 
 /// A contour folded onto the 12 pitch classes: note n becomes the n-th symbol modulo 12,

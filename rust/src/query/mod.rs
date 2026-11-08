@@ -34,7 +34,14 @@ pub struct TranscriptionQueryRecord {
     /// The key the tune was found in (2026-11-07): the recording plays it this many semitones
     /// ABOVE the setting as written, modulo the octave (0-11). Always 0 outside the any-key query.
     pub transpose: u8,
+    /// The other (setting, transposition, score) pairs of the same tune the full search aligned,
+    /// best first, at most OTHER_KEYS_MAX (Cadence, 2026-11-08): how close the tune came in
+    /// another key. Empty outside the any-key query.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub other_keys: Vec<(SettingID, u8, f32)>,
 }
+
+const OTHER_KEYS_MAX: usize = 24;
 
 #[derive(Debug, Serialize)]
 pub struct NameQueryRecord {
@@ -263,10 +270,28 @@ impl QueryEngine {
                         score: *score,
                         transpose: *r,
                         display_name: tune_index.aliases.get(&setting.tune_id).unwrap()[0].clone(),
+                        other_keys: Vec::new(),
                     });
 
                     if results.len() >= self.num_output {
                         break;
+                    }
+                }
+
+                if self.pitch_classes && self.any_key {
+                    let at: std::collections::HashMap<TuneID, usize> = results
+                        .iter()
+                        .enumerate()
+                        .map(|(i, rec)| (rec.setting.tune_id.clone(), i))
+                        .collect();
+                    for (setting_id, score, r) in sorted_rankings.iter() {
+                        if let Some(&i) = at.get(&tune_index.settings[setting_id].tune_id) {
+                            let rec = &mut results[i];
+                            if (rec.setting_id == *setting_id && rec.transpose == *r) || rec.other_keys.len() >= OTHER_KEYS_MAX {
+                                continue;
+                            }
+                            rec.other_keys.push((setting_id.clone(), *r, *score));
+                        }
                     }
                 }
 

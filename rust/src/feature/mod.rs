@@ -98,8 +98,9 @@ impl FeatureExtractor {
         self.clean.clear();
     }
 
-    /// The window fed so far as pitch-class features (pitch-class mode only).
-    pub fn pitch_class_features(&self) -> Features {
+    /// The window fed so far as pitch-class features (pitch-class mode only), and the
+    /// tuning it was read at when it is estimated (pitch_class_tuning).
+    pub fn pitch_class_features(&self) -> (Features, Option<f32>) {
         pitch_class::features_from_magnitudes(&self.magnitudes, &self.fft, &self.interp_inds, if self.pitch_class_tuning { Some(self.sample_rate) } else { None })
     }
 }

@@ -92,6 +92,12 @@ pub struct ContourDebugFeatures {
     pub best_rhythm_score: f32,
     pub best_combined_score: f32,
     pub contour_length: usize,
+    /// Pitch-class mode with any pitch only (Cadence, 2026-11-08): the window's tuning in
+    /// semitones off A = 440 (pitch_class::window_tuning, -0.5 .. 0.5). With a result's
+    /// `transpose`, `transpose + tuning` is the pitch the tune was played at, continuous
+    /// across the half-semitone where the estimate wraps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<f32>,
 }
 
 fn median(values: &mut Vec<f32>) -> f32 {
@@ -252,6 +258,7 @@ fn contour_from_notes(
         best_rhythm_score: best_candidate.rhythm_score,
         best_combined_score: best_candidate.combined_score,
         contour_length: contour.len(),
+        tuning: None,
     };
 
     return Ok((contour, debug));

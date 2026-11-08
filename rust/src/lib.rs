@@ -99,9 +99,14 @@ impl FolkFriend {
     fn transcribe_pitch_classes(
         &mut self,
     ) -> Result<(decode::types::ContourString, decode::ContourDebugFeatures), decode::DecoderError> {
-        let mut features = self.feature_extractor.pitch_class_features();
+        let (mut features, tuning) = self.feature_extractor.pitch_class_features();
         self.feature_extractor.flush();
-        self.feature_decoder.decode_pitch_class_contour(&mut features)
+        self.feature_decoder
+            .decode_pitch_class_contour(&mut features)
+            .map(|(contour, mut debug)| {
+                debug.tuning = tuning;
+                (contour, debug)
+            })
     }
 
     pub fn transcribe_pcm_buffer(
