@@ -247,6 +247,13 @@ impl FolkFriendWASM {
         self.ff.query_engine.set_min_query_length(min_query_length);
     }
 
+    /// The sources of a merged index (each setting's `source`) in the order that wins
+    /// ties among equal scores, first first (Cadence, 2026-11-16) — see
+    /// QueryEngine::set_source_order. Empty by default, which changes nothing.
+    pub fn set_source_order(&mut self, order: Vec<String>) {
+        self.ff.query_engine.set_source_order(order);
+    }
+
     /// Pitch-class recognition (Cadence, 2026-11-07), one-way: see
     /// FolkFriend::set_pitch_class_mode. Contours this instance returns are then
     /// pitch classes ('a' = C ... 'l' = B) and its index is folded to match.

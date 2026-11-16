@@ -23,6 +23,8 @@ pub struct QueryEngine {
     pitch_classes: bool,
     /// Pitch-class queries look in every key (see set_any_key).
     any_key: bool,
+    /// Sources that win ties, first first (see set_source_order).
+    source_order: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +64,30 @@ impl QueryEngine {
             min_query_length: 0,
             pitch_classes: false,
             any_key: false,
+            source_order: Vec::new(),
+        }
+    }
+
+    /// Among EQUAL scores, settings of the sources named first come first (Cadence,
+    /// 2026-11-16): an index merged from several (`Setting::source` — a user's own
+    /// cards, TheSession…) says which wins a tie. A source not named comes after every
+    /// named one. Read at the three places ties are decided: the n-gram shortlist's
+    /// cut-off (both passes), and the final ranking, which also picks the setting that
+    /// represents a tune. Empty by default, and then every result is what it was.
+    pub fn set_source_order(&mut self, order: Vec<String>) {
+        self.source_order = order;
+        self.rank_sources();
+    }
+
+    /// Every setting's place in `source_order` (Setting::tie_rank), worked out once
+    /// rather than looked up in every comparison.
+    fn rank_sources(&mut self) {
+        let order = &self.source_order;
+        if let Some(index) = self.tune_index.as_mut() {
+            for setting in index.settings.values_mut() {
+                let at = order.iter().position(|s| Some(s.as_str()) == setting.source.as_deref()).unwrap_or(order.len());
+                setting.tie_rank = at.min(u8::MAX as usize) as u8;
+            }
         }
     }
 
@@ -102,8 +128,17 @@ impl QueryEngine {
                 .push(setting_id.clone());
         }
 
+        // Numeric ids (TheSession's) in numeric order, as upstream; any other id
+        // (Cadence, 2026-11-15: a user's own cards, other tune sources) after
+        // them, by string — upstream's `parse::<i32>().unwrap()` panicked on one.
+        // An index of numeric ids sorts exactly as before (a stable sort either way).
         for (_, setting_ids) in setting_ids_by_tune_id.iter_mut() {
-            setting_ids.sort_by_key(|k| k.parse::<i32>().unwrap());
+            setting_ids.sort_by(|a, b| match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cmp(b),
+            });
         }
 
         self.setting_ids_by_tune_id = setting_ids_by_tune_id;
@@ -117,6 +152,7 @@ impl QueryEngine {
                 index.build_pitch_class_grams();
             }
         }
+        self.rank_sources();
     }
 
     /// Size of the shortlist re-aligned by Needleman-Wunsch after the n-gram
@@ -155,9 +191,9 @@ impl QueryEngine {
                 // shortlist, untouched, plus the best pairs (setting, transposition r) of
                 // the other keys; each pair is aligned against the query moved down r.
                 let first_search: Vec<(&SettingID, u8)> = if self.pitch_classes && self.any_key {
-                    heuristic::run_transcription_query_any_key(&contour, &tune_index, self.num_repass, ff_config::PC_ANY_KEY_EXTRA)
+                    heuristic::run_transcription_query_any_key(&contour, &tune_index, self.num_repass, ff_config::PC_ANY_KEY_EXTRA, !self.source_order.is_empty())
                 } else {
-                    heuristic::run_transcription_query(&contour, &tune_index, self.num_repass)
+                    heuristic::run_transcription_query(&contour, &tune_index, self.num_repass, !self.source_order.is_empty())
                         .into_iter()
                         .map(|(id, _)| (id, 0))
                         .collect()
@@ -252,7 +288,16 @@ impl QueryEngine {
                     .zip(first_search.iter())
                     .map(|((id, score), (_, r))| (id, score, *r))
                     .collect();
-                sorted_rankings.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+                // Stable: among equal scores, collection order — unless the source
+                // order says otherwise (set_source_order; untouched without one).
+                let ranked = !self.source_order.is_empty();
+                sorted_rankings.sort_by(|x, y| {
+                    let by_score = y.1.partial_cmp(&x.1).unwrap();
+                    if !ranked {
+                        return by_score;
+                    }
+                    by_score.then_with(|| heuristic::tie_rank(tune_index, &x.0).cmp(&heuristic::tie_rank(tune_index, &y.0)))
+                });
                 let mut results: TranscriptionQueryResults = Vec::new();
 
                 let mut tune_ids_in_results: HashSet<TuneID> = HashSet::default();

@@ -18,6 +18,7 @@ pub fn run_transcription_query<'a>(
     // settings_feats: &SettingsFeats,
     tune_index: &'a TuneIndex,
     top_n: usize,
+    rank_ties: bool,
 ) -> Vec<(&'a SettingID, usize)> {
     // The n-grams are a FIXED width (QUERY_NGRAM_SIZE_CONTOUR = 4), so an
     // Aho-Corasick automaton is more machinery than the problem needs: four
@@ -118,8 +119,13 @@ pub fn run_transcription_query<'a>(
     // counts, that made the QUERY_REPASS_SIZE cut-off arbitrary and the engine
     // non-reproducible: the same query returned a different top-1 on ~1 window
     // in 80, and a different top-10 on ~1 in 6. Lexicographic, not numeric —
-    // any total order will do, this one is free.
-    let cmp = |x: &(&SettingID, usize), y: &(&SettingID, usize)| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0));
+    // any total order will do, this one is free. With a source order set
+    // (`rank_ties`, QueryEngine::set_source_order), the earlier source first.
+    let cmp = |x: &(&SettingID, usize), y: &(&SettingID, usize)| {
+        let by_count = y.1.cmp(&x.1);
+        let by_source = || if rank_ties { tie_rank(tune_index, x.0).cmp(&tie_rank(tune_index, y.0)) } else { std::cmp::Ordering::Equal };
+        by_count.then_with(by_source).then_with(|| x.0.cmp(y.0))
+    };
 
     // Select-then-sort rather than sorting all 55k to keep 2000. Because the
     // comparator above is a STRICT TOTAL ORDER (ids are unique, so no two
@@ -150,10 +156,11 @@ pub fn run_transcription_query_any_key<'a>(
     tune_index: &'a TuneIndex,
     top_n: usize,
     extra: usize,
+    rank_ties: bool,
 ) -> Vec<(&'a SettingID, u8)> {
     let q: Vec<u8> = query.bytes().map(|b| b.wrapping_sub(b'a')).collect();
     if q.len() < ff_config::QUERY_NGRAM_SIZE_CONTOUR || q.iter().any(|&c| c >= 12) {
-        return run_transcription_query(query, tune_index, top_n).into_iter().map(|(id, _)| (id, 0)).collect();
+        return run_transcription_query(query, tune_index, top_n, rank_ties).into_iter().map(|(id, _)| (id, 0)).collect();
     }
     // Every query gram moved down r = 0..11 semitones, as the 4-byte code a setting's gram has
     // when it matches the query r semitones up; per code, the (r, count) it scores.
@@ -261,16 +268,23 @@ pub fn run_transcription_query_any_key<'a>(
                 }
             }
         }
-        // the ties kept: smallest id, then smallest r
+        // the ties kept: earlier source (when rank_ties), then smallest id, then smallest r
+        let pref = |id: &SettingID| if rank_ties { tie_rank(tune_index, id) } else { 0 };
         if ties.len() > at_floor {
-            ties.select_nth_unstable_by(at_floor, |x, y| x.0.cmp(y.0).then_with(|| x.1.cmp(&y.1)));
+            ties.select_nth_unstable_by(at_floor, |x, y| pref(x.0).cmp(&pref(y.0)).then_with(|| x.0.cmp(y.0)).then_with(|| x.1.cmp(&y.1)));
             ties.truncate(at_floor);
         }
         kept.extend(ties.into_iter().map(|(id, r)| (floor, id, r)));
-        kept.sort_unstable_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(y.1)).then_with(|| x.2.cmp(&y.2)));
+        kept.sort_unstable_by(|x, y| {
+            y.0.cmp(&x.0).then_with(|| pref(x.1).cmp(&pref(y.1))).then_with(|| x.1.cmp(y.1)).then_with(|| x.2.cmp(&y.2))
+        });
     }
     // the written key exactly as run_transcription_query ranks it
-    let cmp = |x: &(&SettingID, usize), y: &(&SettingID, usize)| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0));
+    let cmp = |x: &(&SettingID, usize), y: &(&SettingID, usize)| {
+        let by_count = y.1.cmp(&x.1);
+        let by_source = || if rank_ties { tie_rank(tune_index, x.0).cmp(&tie_rank(tune_index, y.0)) } else { std::cmp::Ordering::Equal };
+        by_count.then_with(by_source).then_with(|| x.0.cmp(y.0))
+    };
     if written.len() > top_n {
         written.select_nth_unstable_by(top_n, cmp);
         written.truncate(top_n);
@@ -279,6 +293,13 @@ pub fn run_transcription_query_any_key<'a>(
     let mut out: Vec<(&'a SettingID, u8)> = written.into_iter().map(|(id, _)| (id, 0)).collect();
     out.extend(kept.into_iter().map(|(_, id, r)| (id, r)));
     out
+}
+
+/// A setting's source's place in the caller's order among equal scores
+/// (QueryEngine::set_source_order, Cadence 2026-11-16): lower wins. Only read when an
+/// order is set, so that without one every comparison is exactly what it was.
+pub fn tie_rank(tune_index: &TuneIndex, id: &SettingID) -> u8 {
+    tune_index.settings[id].tie_rank
 }
 
 pub fn run_name_query(query: &String, tune_index: &TuneIndex) -> Vec<ScoredName> {
