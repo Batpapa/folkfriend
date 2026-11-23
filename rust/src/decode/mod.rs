@@ -4,7 +4,8 @@ mod octave;
 mod pitch_model;
 pub mod types;
 
-use crate::feature::types::Features;
+use crate::feature::types::{Features, Frame};
+use crate::ff_config;
 use crate::feature::signal;
 use std::fmt;
 use types::{Contour, ContourString, LatticePath};
@@ -63,6 +64,34 @@ impl FeatureDecoder {
         let lattice_path = beam_search::decode_pitch_classes(features)?;
         let (contour, debug) = contour::contour_from_lattice_path_debug(&lattice_path, features, self.sample_rate)?;
         return Ok((types::contour_to_contour_string(&contour), debug));
+    }
+
+    /// Transcription (Cadence, 2026-11-23): the pitch-class decoder over `classes`, each note
+    /// returned with the energy of every octave of its class in `notes` (48-note frames, the
+    /// same frames before the fold), summed over the note — for the octave to be chosen by the
+    /// caller. Flat, 8 values a note: class (0 = C), first frame, frames, power (the class's
+    /// mean energy as the decoder normalised it), then the 4 octaves' energies from MIDI_LOW up.
+    pub fn decode_class_notes(&self, classes: &mut Features, notes: &[Frame]) -> Result<Vec<f32>, DecoderError> {
+        const N: usize = ff_config::MIDI_NUM as usize;
+        let path = beam_search::decode_pitch_classes(classes)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < path.len() {
+            let c = path[i];
+            let mut j = i;
+            while j < path.len() && path[j] == c {
+                j += 1;
+            }
+            let power: f32 = (i..j).map(|t| classes[t][c]).sum::<f32>() / (j - i) as f32;
+            out.extend_from_slice(&[c as f32, i as f32, (j - i) as f32, power]);
+            let mut o = c;
+            while o < N {
+                out.push((i..j).map(|t| notes[t][o]).sum());
+                o += 12;
+            }
+            i = j;
+        }
+        Ok(out)
     }
 
     // Debug/experimental instrumentation (2026-08-18) — same computation as

@@ -376,3 +376,91 @@ pub fn fold_contour_string(contour: &str) -> String {
         .map(|i| ff_config::CONTOUR_TO_QUERY_CHAR[i % 12])
         .collect()
 }
+
+// ── Transcription with octaves (Cadence, 2026-11-23) ──────────────────────────
+// Cadence writes a recording out as ABC (src/session/recognition/transcription.ts). The pitch
+// classes name the notes better than the 48-note path; the octave is then read off the same
+// cleaned frames before they are folded. Measured on the tuneset corpus (Beauguitte, Duggan &
+// Kelleher, ISMIR 2016; note F-measure, onset 50 ms, exact pitch): this decoder with the octave
+// chosen in Cadence 75.0 %, the 48-note path 65.9 %; the tuning correction and leaving the
+// drone in both measured no better. Research record: transcription-bench/JOURNAL.md (outside
+// the repos).
+
+/// The default path's per-frame octave fix (autocorrelate::modified_autocorrelation): energy an
+/// octave below a stronger note is moved up onto it, every comparison against the frame as it
+/// was.
+pub fn fix_octaves(frame: &mut Frame) {
+    const MAX_OCTAVES: usize = N / 12 + 1;
+    for key in 0..12 {
+        let mut inds = [0usize; MAX_OCTAVES];
+        let mut shift = [false; MAX_OCTAVES];
+        let mut count = 0;
+        let mut ind = key;
+        while ind < N - 12 {
+            shift[count] = frame[ind + 12] > frame[ind];
+            inds[count] = ind;
+            count += 1;
+            ind += 12;
+        }
+        for i in 0..count {
+            if shift[i] {
+                frame[inds[i] + 12] += frame[inds[i]];
+                frame[inds[i]] = 0.;
+            }
+        }
+    }
+}
+
+/// The window's harmonic 48-note energies, drone removed — the frames features_from_magnitudes
+/// folds, before the fold.
+pub fn transcription_frames(mags: &[Vec<f32>], fft: &Radix4<f32>, interp: &InterpInds) -> Vec<Frame> {
+    let mut frames = harmonic_note_energies(mags, fft, interp);
+    remove_drone(&mut frames);
+    frames
+}
+
+/// The default path's 48-note frames (autocorrelate::modified_autocorrelation, as take_features
+/// gives them) from the magnitude spectra kept: the same steps after its first FFT — cube root of
+/// the magnitude, second FFT, negatives cut, interpolation onto the notes, octave fix, the
+/// RETAINED_FEATURES_PER_FRAME strongest kept — so the PCM is not fed twice for the
+/// transcription. The magnitude is computed the same way in both paths: bit for bit the same.
+pub fn default_frames(mags: &[Vec<f32>], fft: &Radix4<f32>, interp: &InterpInds) -> Vec<Frame> {
+    let mut buffer = vec![Complex { re: 0.0f32, im: 0.0 }; ff_config::SPEC_WINDOW_SIZE];
+    mags.iter()
+        .map(|mag| {
+            for i in 0..buffer.len() {
+                buffer[i] = Complex { re: mag[i].cbrt(), im: 0. };
+            }
+            fft.process(&mut buffer);
+            for c in buffer.iter_mut() {
+                if c.re.signum() == -1. {
+                    c.re = 0.;
+                }
+            }
+            let mut frame: Frame = [0.; N];
+            for i in 0..ff_config::SPEC_BINS_NUM as usize {
+                let ii = &interp[i];
+                frame[i / ff_config::SPEC_BINS_PER_MIDI as usize] +=
+                    ii.hi_weight * buffer[ii.hi_index].re + ii.lo_weight * buffer[ii.hi_index - 1].re;
+            }
+            fix_octaves(&mut frame);
+            keep_strongest(&mut frame, N, ff_config::RETAINED_FEATURES_PER_FRAME as usize);
+            frame
+        })
+        .collect()
+}
+
+/// Pitch-class features of 48-note frames, as features_from_magnitudes makes them.
+pub fn class_features(frames: &[Frame]) -> Features {
+    frames
+        .iter()
+        .map(|fr| {
+            let mut pc: Frame = [0.; N];
+            for j in 0..N {
+                pc[j % 12] += fr[j];
+            }
+            keep_strongest(&mut pc, 12, ff_config::PC_RETAINED_CLASSES);
+            pc
+        })
+        .collect()
+}

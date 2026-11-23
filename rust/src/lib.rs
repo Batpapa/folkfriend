@@ -96,6 +96,25 @@ impl FolkFriend {
         self.query_engine.set_any_key(on);
     }
 
+    /// Transcription (Cadence, 2026-11-23): the frames kept as magnitudes since the last flush
+    /// (keep_magnitudes), decoded as pitch classes, each note with its octaves' energies —
+    /// FeatureDecoder::decode_class_notes. Flushes.
+    pub fn transcribe_notes(&mut self) -> Result<Vec<f32>, decode::DecoderError> {
+        let fe = &self.feature_extractor;
+        let frames = feature::pitch_class::transcription_frames(&fe.magnitudes, &fe.fft, &fe.interp_inds);
+        self.feature_extractor.flush();
+        let mut classes = feature::pitch_class::class_features(&frames);
+        let fixed: Vec<feature::types::Frame> = frames
+            .iter()
+            .map(|f| {
+                let mut g = *f;
+                feature::pitch_class::fix_octaves(&mut g);
+                g
+            })
+            .collect();
+        self.feature_decoder.decode_class_notes(&mut classes, &fixed)
+    }
+
     fn transcribe_pitch_classes(
         &mut self,
     ) -> Result<(decode::types::ContourString, decode::ContourDebugFeatures), decode::DecoderError> {
@@ -322,6 +341,31 @@ impl FolkFriendWASM {
     // error — `features: null` here (rather than omitting note/tempo stats
     // entirely) is deliberate: a noise-study harness needs to know this
     // window produced literally zero usable notes, not just skip the row.
+    /// Transcription (Cadence, 2026-11-23): frames fed from now on are kept as magnitude
+    /// spectra, for transcribe_notes — the query engine and the pitch-class mode are left as
+    /// they are. Call after set_sample_rate (a new rate makes a new extractor).
+    pub fn keep_magnitudes(&mut self) {
+        self.ff.feature_extractor.pitch_class_mode = true;
+        self.ff.feature_extractor.flush();
+    }
+
+    /// Transcription (Cadence, 2026-11-23): the 48-note frames take_features would give for the
+    /// frames kept as magnitudes (keep_magnitudes), frames x 48 — bit for bit the same, without
+    /// feeding the PCM twice. Keeps the magnitudes: transcribe_notes reads them after.
+    pub fn take_magnitude_features(&mut self) -> js_sys::Float32Array {
+        let fe = &self.ff.feature_extractor;
+        let frames = feature::pitch_class::default_frames(&fe.magnitudes, &fe.fft, &fe.interp_inds);
+        let flat: Vec<f32> = frames.iter().flat_map(|f| f.iter().copied()).collect();
+        js_sys::Float32Array::from(&flat[..])
+    }
+
+    /// Transcription (Cadence, 2026-11-23): FolkFriend::transcribe_notes — 8 values a note
+    /// (class, first frame, frames, power, 4 octave energies), empty when no notes were heard.
+    pub fn transcribe_notes(&mut self) -> js_sys::Float32Array {
+        let flat = self.ff.transcribe_notes().unwrap_or_default();
+        js_sys::Float32Array::from(&flat[..])
+    }
+
     pub fn transcribe_pcm_buffer_debug(&mut self) -> String {
         match self.ff.transcribe_pcm_buffer_debug() {
             Ok((transcription, features)) => json!({
